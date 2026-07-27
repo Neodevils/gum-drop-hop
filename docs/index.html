@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gum Drop Hop — 2P</title>
+<style>
+  html,body{margin:0;height:100%;background:#1a1b1e;color:#e8e8ea;
+            font:14px/1.4 system-ui,sans-serif;overflow:hidden}
+  #wrap{display:flex;height:100%}
+  .pane{flex:1;display:flex;flex-direction:column;min-width:0;border-right:1px solid #34363b}
+  .pane:last-child{border-right:0}
+  .tag{padding:6px 10px;background:#25262a;font-weight:600;letter-spacing:.3px}
+  .tag small{font-weight:400;opacity:.6;margin-left:8px}
+  ruffle-player{flex:1;min-height:0}
+</style>
+
+<div id="wrap">
+  <div class="pane"><div class="tag">Player 1 <small>W A S D &middot; Shift = action</small></div></div>
+  <div class="pane"><div class="tag">Player 2 <small>&larr; &uarr; &darr; &rarr; &middot; Shift = action</small></div></div>
+</div>
+
+<script src="ruffle/ruffle.js"></script>
+<script>
+// Two independent Ruffle instances, one per player. Keys are captured globally and
+// re-dispatched at the owning instance, so focus never decides who is driving.
+// ponytail: local 2P only — the SWF is an opaque AS2 binary, no hook to sync state
+// between instances. Networked play needs the game source, not a transport.
+
+// Calibration knob: left = physical key you press, right = key the SWF listens for.
+const KEYMAP = [
+  {KeyW:'ArrowUp', KeyA:'ArrowLeft', KeyS:'ArrowDown', KeyD:'ArrowRight',
+   ShiftLeft:'Shift', Space:'Space'},
+  {ArrowUp:'ArrowUp', ArrowLeft:'ArrowLeft', ArrowDown:'ArrowDown', ArrowRight:'ArrowRight',
+   ShiftRight:'Shift', Enter:'Space'},
+];
+
+const KEYVAL = {ArrowUp:['ArrowUp',38], ArrowDown:['ArrowDown',40], ArrowLeft:['ArrowLeft',37],
+                ArrowRight:['ArrowRight',39], Space:[' ',32], Shift:['Shift',16], Enter:['Enter',13]};
+
+const ruffle = window.RufflePlayer.newest();
+const players = [...document.querySelectorAll('.pane')].map(pane => {
+  const p = ruffle.createPlayer();
+  pane.append(p);
+  p.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
+                   letterbox:'on', scale:'showAll', contextMenu:'off'});
+  return p;
+});
+
+function route(e) {
+  if (e.repeat) return;
+  for (let i = 0; i < KEYMAP.length; i++) {
+    const out = KEYMAP[i][e.code];
+    if (!out) continue;
+    e.preventDefault();
+    const [key, keyCode] = KEYVAL[out] || [out, 0];
+    players[i].dispatchEvent(new KeyboardEvent(e.type,
+      {key, code: out, keyCode, which: keyCode, bubbles: false, composed: true}));
+    return;
+  }
+}
+addEventListener('keydown', route, true);
+addEventListener('keyup', route, true);
+</script>
