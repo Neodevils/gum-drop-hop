@@ -96,14 +96,21 @@ ws.onmessage = e => {
   if (m.t === 'role') { host = m.host; startGame(); return; }
 
   // The relay only tells the room about an arrival, so the arrival learns who was
-  // already there from the greeting back.
-  if (m.t === 'join') { peers.add(m.from); send({t:'hello', to:m.from}); }
+  // already there from the greeting back. An arrival also restarts the room, which
+  // is the only way both copies can be on the same screen at the same time.
+  if (m.t === 'join') { peers.add(m.from); send({t:'hello', to:m.from}); restartAll(); }
   else if (m.t === 'hello') peers.add(m.from);
+  // A ready that lands after the room already started belongs to a peer still
+  // sitting at the barrier — send it on its way rather than leaving it frozen.
+  else if (m.t === 'ready') { ready.add(m.from); playing ? send({t:'go', to:m.from}) : maybeGo(); }
+  else if (m.t === 'go') go();
   else if (m.t === 'leave') {
     // Otherwise their character keeps running in whatever direction they left it.
     for (const code of remoteHeld.get(m.from) || []) inject(code, false);
     remoteHeld.delete(m.from);
     peers.delete(m.from);
+    ready.delete(m.from);
+    maybeGo();                  // don't leave the survivor frozen at the barrier
   } else if (m.t === 'key') {
     // A peer may only drive the character its own role owns.
     if (!ROLE_KEYS[host ? 'guest' : 'host'].includes(m.code)) return;
@@ -117,9 +124,17 @@ ws.onmessage = e => {
     load();
   }
 
-  $('#peers').textContent = peers.size ? '2 playing' : 'waiting for the other player';
+  hud();
   setActivity();
 };
+
+// The room id is on screen because "are we even in the same room" is otherwise
+// unanswerable from either seat.
+function hud() {
+  $('#peers').textContent = `room ${room} · ` + (!peers.size
+    ? 'waiting for the other player'
+    : playing ? '2 playing' : 'syncing…');
+}
 ws.onclose = () => $('#role').textContent = 'disconnected';
 ws.onerror = () => {
   $('#role').textContent = 'relay unreachable';
@@ -131,9 +146,54 @@ ws.onerror = () => {
 };
 
 /* ---------- the game, one identical copy per player ---------- */
+// Both copies are held at the first frame until everyone has finished loading,
+// then released together — otherwise whoever loaded first is already several
+// seconds into the menu when the other arrives, and P1's Shift lands on two
+// different screens. ponytail: this aligns the start, not every frame after it;
+// a shared clock would be the next step if mid-game drift ever shows up.
+const ready = new Set();
+let playing = false, loadSeq = 0, loading = Promise.resolve();
+
+// A guest loads on arrival and is told to restart in the same breath, so two loads
+// land on one player unless they are queued — and the second tearing down the first
+// mid-flight leaves a blank screen.
 function load() {
-  player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
-                        letterbox:'on', scale:'showAll', contextMenu:'off'});
+  const seq = ++loadSeq;
+  playing = false;
+  ready.clear();
+  hud();
+  return loading = loading.then(() => seq === loadSeq && doLoad(seq));
+}
+
+async function doLoad(seq) {
+  await player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
+                              letterbox:'on', scale:'showAll', contextMenu:'off'});
+  if (seq !== loadSeq) return;   // a newer restart overtook this one
+  player.pause();
+  // Ruffle puts its own play button up on pause; nobody here is meant to click it.
+  player.shadowRoot?.querySelector('#play-button')?.style.setProperty('display', 'none');
+  if (host) { ready.add('me'); maybeGo(); } else send({t:'ready'});
+}
+
+// Host is the referee: it starts everyone once every copy reports in, and starts
+// alone if it is the only one here.
+function maybeGo() {
+  if (!host || !ready.has('me')) return;
+  if ([...peers].some(p => !ready.has(p))) return;
+  send({t:'go'});
+  go();
+}
+
+function go() {
+  playing = true;
+  player.play();
+  player.focus();
+  hud();
+}
+
+function restartAll() {
+  send({t:'restart'});
+  load();
 }
 
 function startGame() {
@@ -177,7 +237,7 @@ function route(e) {
   if (host === null || e.repeat) return;    // role not assigned yet
 
   // Restarting one copy alone just guarantees the two disagree.
-  if (e.code === 'KeyR' && e.type === 'keydown') { send({t:'restart'}); load(); return; }
+  if (e.code === 'KeyR' && e.type === 'keydown') return restartAll();
 
   const code = host ? e.code : (GUEST_ALIAS[e.code] || e.code);
   if (!ROLE_KEYS[host ? 'host' : 'guest'].includes(code)) {
