@@ -1,61 +1,138 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gum Drop Hop — 2P</title>
+<title>Gum Drop Hop</title>
 <style>
-  html,body{margin:0;height:100%;background:#1a1b1e;color:#e8e8ea;
-            font:14px/1.4 system-ui,sans-serif;overflow:hidden}
-  #wrap{display:flex;height:100%}
-  .pane{flex:1;display:flex;flex-direction:column;min-width:0;border-right:1px solid #34363b}
-  .pane:last-child{border-right:0}
-  .tag{padding:6px 10px;background:#25262a;font-weight:600;letter-spacing:.3px}
-  .tag small{font-weight:400;opacity:.6;margin-left:8px}
-  ruffle-player{flex:1;min-height:0}
+  html,body{margin:0;height:100%;background:#000;color:#e8e8ea;
+            font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+  #stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  ruffle-player,video{width:100%;height:100%;object-fit:contain;background:#000}
+  #hud{position:absolute;top:0;left:0;right:0;display:flex;gap:14px;padding:7px 12px;
+       background:linear-gradient(#000c,#0000);pointer-events:none;z-index:2}
+  #hud b{color:#ff9ecb}
+  #hud span{opacity:.65}
 </style>
 
-<div id="wrap">
-  <div class="pane"><div class="tag">Player 1 <small>W A S D &middot; Shift = action</small></div></div>
-  <div class="pane"><div class="tag">Player 2 <small>&larr; &uarr; &darr; &rarr; &middot; Shift = action</small></div></div>
-</div>
+<div id="stage"></div>
+<div id="hud"><b id="role">connecting…</b><span>P1 <b>WASD</b></span><span>P2 <b>arrows</b></span><span id="peers"></span></div>
 
 <script src="ruffle/ruffle.js"></script>
 <script>
-// Two independent Ruffle instances, one per player. Keys are captured globally and
-// re-dispatched at the owning instance, so focus never decides who is driving.
-// ponytail: local 2P only — the SWF is an opaque AS2 binary, no hook to sync state
-// between instances. Networked play needs the game source, not a transport.
+// One game, one screen. The host runs the only Ruffle instance and streams its canvas
+// over WebRTC; every other peer watches that video and sends key events back, which the
+// host injects into the same instance. So both players act on identical pixels.
+//
+// ponytail: video is one-way host->viewers and carries no audio (Ruffle mixes through
+// WebAudio, not the canvas). Tap the AudioContext destination into the stream if sound
+// matters. ponytail: STUN only — a symmetric-NAT pair needs a TURN server.
 
-// Calibration knob: left = physical key you press, right = key the SWF listens for.
-const KEYMAP = [
-  {KeyW:'ArrowUp', KeyA:'ArrowLeft', KeyS:'ArrowDown', KeyD:'ArrowRight',
-   ShiftLeft:'Shift', Space:'Space'},
-  {ArrowUp:'ArrowUp', ArrowLeft:'ArrowLeft', ArrowDown:'ArrowDown', ArrowRight:'ArrowRight',
-   ShiftRight:'Shift', Enter:'Space'},
-];
+// Calibration knob: physical key -> key the SWF listens for. Both players hit the same
+// controls; the SWF is single-player, so this is one character, two hands.
+const KEYMAP = {
+  KeyW:'ArrowUp', KeyA:'ArrowLeft', KeyS:'ArrowDown', KeyD:'ArrowRight', ShiftLeft:'Shift',
+  ArrowUp:'ArrowUp', ArrowLeft:'ArrowLeft', ArrowDown:'ArrowDown', ArrowRight:'ArrowRight',
+  ShiftRight:'Shift', Space:'Space', Enter:'Space',
+};
+const KEYVAL = {ArrowUp:[38], ArrowDown:[40], ArrowLeft:[37], ArrowRight:[39],
+                Space:[32,' '], Shift:[16]};
 
-const KEYVAL = {ArrowUp:['ArrowUp',38], ArrowDown:['ArrowDown',40], ArrowLeft:['ArrowLeft',37],
-                ArrowRight:['ArrowRight',39], Space:[' ',32], Shift:['Shift',16], Enter:['Enter',13]};
+const ICE = {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
+const q = new URLSearchParams(location.search);
+// Discord hands every participant of one activity the same instance_id -> same room.
+const room = q.get('instance_id') || location.hash.slice(1) || 'lobby';
 
-const ruffle = window.RufflePlayer.newest();
-const players = [...document.querySelectorAll('.pane')].map(pane => {
-  const p = ruffle.createPlayer();
-  pane.append(p);
-  p.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
-                   letterbox:'on', scale:'showAll', contextMenu:'off'});
-  return p;
-});
+const stage = document.getElementById('stage');
+// Inside Discord every external host must be reached through the /.proxy/ prefix;
+// standalone we hit the Worker directly. ?ws= overrides for a self-hosted relay.
+const RELAY = q.get('ws') || (q.get('frame_id')
+  ? `${location.origin.replace('http','ws')}/.proxy/ws`
+  : 'wss://gum-drop-hop.truth-typhoon.workers.dev/ws');
+const ws = new WebSocket(`${RELAY}?room=${encodeURIComponent(room)}`);
+const send = m => ws.readyState === 1 && ws.send(JSON.stringify(m));
 
-function route(e) {
-  if (e.repeat) return;
-  for (let i = 0; i < KEYMAP.length; i++) {
-    const out = KEYMAP[i][e.code];
-    if (!out) continue;
-    e.preventDefault();
-    const [key, keyCode] = KEYVAL[out] || [out, 0];
-    players[i].dispatchEvent(new KeyboardEvent(e.type,
-      {key, code: out, keyCode, which: keyCode, bubbles: false, composed: true}));
-    return;
+let host = null, player = null, pcs = new Map();
+
+ws.onmessage = async e => {
+  const m = JSON.parse(e.data);
+  if (m.t === 'role') { host = m.host; host ? startHost() : startViewer(); return; }
+  if (host) await hostMsg(m); else await viewerMsg(m);
+  document.getElementById('peers').textContent = pcs.size ? `${pcs.size} connected` : '';
+};
+ws.onclose = () => document.getElementById('role').textContent = 'disconnected';
+
+/* ---------- host: owns the game, streams it out ---------- */
+let stream;
+function startHost() {
+  document.getElementById('role').textContent = 'HOST';
+  player = window.RufflePlayer.newest().createPlayer();
+  stage.append(player);
+  player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
+                        letterbox:'on', scale:'showAll', contextMenu:'off'});
+}
+
+async function canvasStream() {
+  if (stream) return stream;
+  let canvas;
+  while (!(canvas = player.shadowRoot?.querySelector('canvas')))
+    await new Promise(r => setTimeout(r, 200));
+  return stream = canvas.captureStream(30);
+}
+
+async function hostMsg(m) {
+  if (m.t === 'join') {
+    const pc = new RTCPeerConnection(ICE);
+    pcs.set(m.from, pc);
+    (await canvasStream()).getTracks().forEach(t => pc.addTrack(t, stream));
+    pc.onicecandidate = e => e.candidate && send({t:'ice', c:e.candidate, to:m.from});
+    await pc.setLocalDescription(await pc.createOffer());
+    send({t:'offer', d:pc.localDescription, to:m.from});
+  } else if (m.t === 'answer') {
+    await pcs.get(m.from)?.setRemoteDescription(m.d);
+  } else if (m.t === 'ice') {
+    await pcs.get(m.from)?.addIceCandidate(m.c).catch(()=>{});
+  } else if (m.t === 'key') {
+    inject(m.code, m.down);
+  } else if (m.t === 'leave') {
+    pcs.get(m.from)?.close(); pcs.delete(m.from);
   }
+}
+
+function inject(out, down) {
+  const [keyCode, key] = KEYVAL[out] || [0, out];
+  player?.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
+    {key: key ?? out, code: out, keyCode, which: keyCode, bubbles: false, composed: true}));
+}
+
+/* ---------- viewer: watches the host's pixels, sends keys back ---------- */
+let pc;
+function startViewer() {
+  document.getElementById('role').textContent = 'PLAYER 2';
+  const v = document.createElement('video');
+  v.autoplay = v.playsInline = v.muted = true;
+  stage.append(v);
+  pc = new RTCPeerConnection(ICE);
+  pc.ontrack = e => v.srcObject = e.streams[0];
+  pc.onicecandidate = e => e.candidate && send({t:'ice', c:e.candidate});
+  pcs.set(0, pc);
+}
+
+async function viewerMsg(m) {
+  if (m.t === 'offer') {
+    await pc.setRemoteDescription(m.d);
+    await pc.setLocalDescription(await pc.createAnswer());
+    send({t:'answer', d:pc.localDescription, to:m.from});
+  } else if (m.t === 'ice') {
+    await pc.addIceCandidate(m.c).catch(()=>{});
+  }
+}
+
+/* ---------- input: host injects locally, viewers ship it upstream ---------- */
+function route(e) {
+  const out = KEYMAP[e.code];
+  if (!out || e.repeat) return;
+  e.preventDefault();
+  const down = e.type === 'keydown';
+  host ? inject(out, down) : send({t:'key', code:out, down});
 }
 addEventListener('keydown', route, true);
 addEventListener('keyup', route, true);
