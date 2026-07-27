@@ -6,7 +6,7 @@
   html,body{margin:0;height:100%;background:#000;color:#e8e8ea;overscroll-behavior:none;
             font:13px/1.4 system-ui,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
   #stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
-  ruffle-player,video{width:100%;height:100%;object-fit:contain;background:#000}
+  ruffle-player,video,#feed{width:100%;height:100%;object-fit:contain;background:#000}
   #hud{position:absolute;top:0;left:0;right:0;display:flex;gap:14px;padding:7px 12px;
        background:linear-gradient(#000c,#0000);pointer-events:none;z-index:2}
   #hud b{color:#ff9ecb} #hud span{opacity:.7}
@@ -66,6 +66,12 @@ const PAD_KEYS = {
 
 const ICE = {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
 const q = new URLSearchParams(location.search);
+
+// Discord's activity iframe removes RTCPeerConnection outright — everything has to
+// go through their proxy — so there it is null, not undefined. Where it is missing,
+// the host ships JPEG frames over the same WebSocket instead. ?nortc=1 forces that
+// path in a normal browser, the only way to test it outside Discord.
+const RTC = q.has('nortc') ? null : window.RTCPeerConnection;
 const inDiscord = location.hostname.endsWith('.discordsays.com') ||
                   q.has('instance_id') || q.has('frame_id') || q.has('discord_proxy_ticket');
 
@@ -90,6 +96,7 @@ ws.onmessage = async e => {
   const m = JSON.parse(e.data);
   if (m.t === 'role') { host = m.host; host ? startHost() : startViewer(); return; }
   if (host) await hostMsg(m); else await viewerMsg(m);
+  if (m.t === 'frame') return;   // ten a second — keep it off the HUD and Discord
   $('#peers').textContent = pcs.size ? `${pcs.size + 1} playing` : 'waiting for P2';
   setActivity();
 };
@@ -114,16 +121,50 @@ function startHost() {
                         letterbox:'on', scale:'showAll', contextMenu:'off'});
 }
 
-async function canvasStream() {
-  if (stream) return stream;
+async function gameCanvas() {
   let canvas;
   while (!(canvas = player.shadowRoot?.querySelector('canvas')))
     await new Promise(r => setTimeout(r, 200));
-  return stream = canvas.captureStream(30);
+  return canvas;
+}
+
+async function canvasStream() {
+  return stream ||= (await gameCanvas()).captureStream(30);
+}
+
+// Frames come off the captured stream rather than the Ruffle canvas itself: that
+// canvas is WebGL without preserveDrawingBuffer, so reading it after compositing
+// gives a blank frame. The video has to be in the document to decode.
+// ponytail: 480px at 10fps, a few KB a frame; drop either if the relay strains.
+let frames;
+async function startFrames() {
+  if (frames) return;
+  const v = document.createElement('video');
+  v.autoplay = v.playsInline = v.muted = true;
+  v.style.cssText = 'position:fixed;width:1px;height:1px;opacity:.01;pointer-events:none';
+  document.body.append(v);
+  v.srcObject = await canvasStream();
+  v.play().catch(() => {});
+
+  // Read the video once it has decoded, else the canvas — which of the two yields
+  // real pixels depends on how Ruffle got its WebGL context, and a headless tab
+  // renders neither, so this cannot be settled anywhere but a real browser.
+  const src = await gameCanvas();
+  const c = document.createElement('canvas'), ctx = c.getContext('2d');
+  frames = setInterval(() => {
+    if (!pcs.size) return;
+    const from = v.videoWidth ? v : src;
+    const w = from.videoWidth || from.width, h = from.videoHeight || from.height;
+    if (!w) return;
+    c.width = 480; c.height = Math.round(480 * h / w);
+    ctx.drawImage(from, 0, 0, c.width, c.height);
+    send({t:'frame', d: c.toDataURL('image/jpeg', 0.5)});
+  }, 100);
 }
 
 async function hostMsg(m) {
   if (m.t === 'join') {
+    if (!RTC) { pcs.set(m.from, null); return startFrames(); }
     const pc = new RTCPeerConnection(ICE);
     pcs.set(m.from, pc);
     (await canvasStream()).getTracks().forEach(t => pc.addTrack(t, stream));
@@ -145,6 +186,7 @@ async function hostMsg(m) {
     for (const code of guestHeld.get(m.from) || []) inject(code, false);
     guestHeld.delete(m.from);
     pcs.get(m.from)?.close(); pcs.delete(m.from);
+    if (!pcs.size && frames) { clearInterval(frames); frames = null; }
   }
 }
 
@@ -159,10 +201,18 @@ function inject(code, down) {
 }
 
 /* ---------- viewer: watches the host's pixels, sends keys back ---------- */
-let pc;
+let pc, feed;
 function startViewer() {
   $('#role').textContent = 'PLAYER 2';
   $('#keys').innerHTML = 'your keys <b>arrow keys</b>';
+  if (!RTC) {
+    const img = new Image();
+    img.id = 'feed';
+    stage.append(img);
+    feed = img;
+    pcs.set(0, null);            // so the HUD still counts the host as a peer
+    return;
+  }
   const v = document.createElement('video');
   v.autoplay = v.playsInline = v.muted = true;
   stage.append(v);
@@ -173,7 +223,9 @@ function startViewer() {
 }
 
 async function viewerMsg(m) {
-  if (m.t === 'offer') {
+  if (m.t === 'frame') {
+    if (feed) feed.src = m.d;
+  } else if (m.t === 'offer') {
     await pc.setRemoteDescription(m.d);
     await pc.setLocalDescription(await pc.createAnswer());
     send({t:'answer', d:pc.localDescription, to:m.from});
@@ -244,19 +296,26 @@ async function initDiscord() {
     sdk = new DiscordSDK(client_id);
     await sdk.ready();
     el.textContent = 'discord ✓';
+
+    // Authorizing buys nothing but a custom presence line — Discord already shows
+    // the activity without it — and every launch that fails re-prompts the user.
+    // Opt in with ?rpc=1 once the app really has the rpc.activities.write scope.
+    if (!q.has('rpc')) return;
+
     const { code } = await sdk.commands.authorize({
       client_id, response_type: 'code', state: '', prompt: 'none', scope: SCOPES,
     });
     const r = await fetch('/api/auth/discord/token', {
       method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({code}),
     });
-    const { access_token } = await r.json();
-    if (!access_token) throw new Error('no token');
+    const { access_token, error, error_description } = await r.json();
+    if (!access_token) throw new Error(error_description || error || 'no token');
     await sdk.commands.authenticate({ access_token });
     authed = true;
     setActivity();
   } catch (err) {
-    el.textContent = '';
+    // Swallowing this is why "no status" looked like nothing happening at all.
+    el.textContent = `discord: ${err.message || err}`;
     console.warn('discord init failed', err);
   }
 }
