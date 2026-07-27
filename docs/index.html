@@ -6,7 +6,7 @@
   html,body{margin:0;height:100%;background:#000;color:#e8e8ea;overscroll-behavior:none;
             font:13px/1.4 system-ui,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
   #stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
-  ruffle-player,video,#feed{width:100%;height:100%;object-fit:contain;background:#000}
+  ruffle-player{width:100%;height:100%;background:#000}
   #hud{position:absolute;top:0;left:0;right:0;display:flex;gap:14px;padding:7px 12px;
        background:linear-gradient(#000c,#0000);pointer-events:none;z-index:2}
   #hud b{color:#ff9ecb} #hud span{opacity:.7}
@@ -32,13 +32,14 @@
 
 <script src="ruffle/ruffle.js"></script>
 <script>
-// One game, one screen. The host runs the only Ruffle instance and streams its canvas
-// over WebRTC; every other peer watches that video and sends key events back, which the
-// host injects into the same instance. So both players act on identical pixels.
+// Both players run their own copy of the SWF and mirror keystrokes at each other,
+// the way a shared keyboard would. Nobody streams video: each screen renders the
+// game natively, at full quality, and both characters move on both screens because
+// both instances receive both key sets.
 //
-// ponytail: video is one-way host->viewers and carries no audio (Ruffle mixes through
-// WebAudio, not the canvas). Tap the AudioContext destination into the stream if sound
-// matters. ponytail: STUN only — a symmetric-NAT pair needs a TURN server.
+// ponytail: no lockstep and no rollback — keys apply on arrival, so anything the
+// game decides at random can drift the two copies apart. F5 together, or press R,
+// which restarts both. Add frame-synced input queues only if drift is actually felt.
 
 const RELAY_DIRECT = 'wss://gum-drop-hop.neodevils-contact.workers.dev/ws';
 const SCOPES = ['identify', 'rpc.activities.write'];
@@ -52,27 +53,22 @@ const KEYS = {
 };
 
 // Frame 96 runs two character clips with key sets hardcoded in the SWF: 87/83/65/68
-// drives one, 37/38/39/40 drives the other. So each machine is allowed exactly one
-// set and the mapping is identity — this is a gate, not a translation. Gating is the
-// whole point: without it the host's arrows drive the second character locally.
+// drives one, 37/38/39/40 drives the other. Each machine owns exactly one set and
+// relays it; the other set only ever arrives over the wire. Without that split both
+// characters would answer to whoever's keyboard is nearest.
 const ROLE_KEYS = {
   host:  ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'Space'],
   guest: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'],
 };
+// P2's keys are a local injection either way, so WASD can stand in for the arrows —
+// Discord and Safari both have their own claims on the arrow keys.
 const GUEST_ALIAS = {KeyW:'ArrowUp', KeyS:'ArrowDown', KeyA:'ArrowLeft', KeyD:'ArrowRight'};
 const PAD_KEYS = {
   host:  {left:'KeyA', right:'KeyD', down:'KeyS', up:'KeyW'},
   guest: {left:'ArrowLeft', right:'ArrowRight', down:'ArrowDown', up:'ArrowUp'},
 };
 
-const ICE = {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
 const q = new URLSearchParams(location.search);
-
-// Discord's activity iframe removes RTCPeerConnection outright — everything has to
-// go through their proxy — so there it is null, not undefined. Where it is missing,
-// the host ships JPEG frames over the same WebSocket instead. ?nortc=1 forces that
-// path in a normal browser, the only way to test it outside Discord.
-const RTC = q.has('nortc') ? null : window.RTCPeerConnection;
 const inDiscord = location.hostname.endsWith('.discordsays.com') ||
                   q.has('instance_id') || q.has('frame_id') || q.has('discord_proxy_ticket');
 
@@ -91,14 +87,37 @@ const stage = $('#stage');
 const ws = new WebSocket(`${RELAY}?room=${encodeURIComponent(room)}`);
 const send = m => ws.readyState === 1 && ws.send(JSON.stringify(m));
 
-let host = null, player = null, pcs = new Map(), guestHeld = new Map();
+let host = null, player = null;
+const peers = new Set();
+const remoteHeld = new Map();   // peer id -> keys it is holding
 
-ws.onmessage = async e => {
+ws.onmessage = e => {
   const m = JSON.parse(e.data);
-  if (m.t === 'role') { host = m.host; host ? startHost() : startViewer(); return; }
-  if (host) await hostMsg(m); else await viewerMsg(m);
-  if (m.t === 'frame') return;   // ten a second — keep it off the HUD and Discord
-  $('#peers').textContent = pcs.size ? `${pcs.size + 1} playing` : 'waiting for P2';
+  if (m.t === 'role') { host = m.host; startGame(); return; }
+
+  // The relay only tells the room about an arrival, so the arrival learns who was
+  // already there from the greeting back.
+  if (m.t === 'join') { peers.add(m.from); send({t:'hello', to:m.from}); }
+  else if (m.t === 'hello') peers.add(m.from);
+  else if (m.t === 'leave') {
+    // Otherwise their character keeps running in whatever direction they left it.
+    for (const code of remoteHeld.get(m.from) || []) inject(code, false);
+    remoteHeld.delete(m.from);
+    peers.delete(m.from);
+  } else if (m.t === 'key') {
+    // A peer may only drive the character its own role owns.
+    if (!ROLE_KEYS[host ? 'guest' : 'host'].includes(m.code)) return;
+    peers.add(m.from);
+    let h = remoteHeld.get(m.from);
+    if (!h) remoteHeld.set(m.from, h = new Set());
+    m.down ? h.add(m.code) : h.delete(m.code);
+    $('#last').textContent = `got ${m.code}`;
+    inject(m.code, m.down);
+  } else if (m.t === 'restart') {
+    load();
+  }
+
+  $('#peers').textContent = peers.size ? '2 playing' : 'waiting for the other player';
   setActivity();
 };
 ws.onclose = () => $('#role').textContent = 'disconnected';
@@ -111,88 +130,25 @@ ws.onerror = () => {
     : `cannot reach ${RELAY}`;
 };
 
-/* ---------- host: owns the game, streams it out ---------- */
-let stream;
-function startHost() {
-  $('#role').textContent = 'PLAYER 1';
-  $('#keys').innerHTML = 'your keys <b>WASD</b> · press <b>Shift</b> at the menu for 2-player';
-  player = window.RufflePlayer.newest().createPlayer();
-  stage.append(player);
+/* ---------- the game, one identical copy per player ---------- */
+function load() {
   player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
                         letterbox:'on', scale:'showAll', contextMenu:'off'});
 }
 
-async function gameCanvas() {
-  let canvas;
-  while (!(canvas = player.shadowRoot?.querySelector('canvas')))
-    await new Promise(r => setTimeout(r, 200));
-  return canvas;
-}
-
-async function canvasStream() {
-  return stream ||= (await gameCanvas()).captureStream(30);
-}
-
-// Frames come off the captured stream rather than the Ruffle canvas itself: that
-// canvas is WebGL without preserveDrawingBuffer, so reading it after compositing
-// gives a blank frame. The video has to be in the document to decode.
-// ponytail: 480px at 10fps, a few KB a frame; drop either if the relay strains.
-let frames;
-async function startFrames() {
-  if (frames) return;
-  const v = document.createElement('video');
-  v.autoplay = v.playsInline = v.muted = true;
-  v.style.cssText = 'position:fixed;width:1px;height:1px;opacity:.01;pointer-events:none';
-  document.body.append(v);
-  v.srcObject = await canvasStream();
-  v.play().catch(() => {});
-
-  // Read the video once it has decoded, else the canvas — which of the two yields
-  // real pixels depends on how Ruffle got its WebGL context, and a headless tab
-  // renders neither, so this cannot be settled anywhere but a real browser.
-  const src = await gameCanvas();
-  const c = document.createElement('canvas'), ctx = c.getContext('2d');
-  // ponytail: 800px at 12fps is roughly 400KB/s through the relay. WIDTH and the
-  // interval are the two knobs — halve them if Discord starts dropping the socket.
-  const WIDTH = 800;
-  frames = setInterval(() => {
-    if (!pcs.size) return;
-    const from = v.videoWidth ? v : src;
-    const w = from.videoWidth || from.width, h = from.videoHeight || from.height;
-    if (!w) return;
-    c.width = Math.min(WIDTH, w); c.height = Math.round(c.width * h / w);
-    ctx.drawImage(from, 0, 0, c.width, c.height);
-    send({t:'frame', d: c.toDataURL('image/jpeg', 0.72)});
-  }, 80);
-}
-
-async function hostMsg(m) {
-  if (m.t === 'join') {
-    if (!RTC) { pcs.set(m.from, null); return startFrames(); }
-    const pc = new RTCPeerConnection(ICE);
-    pcs.set(m.from, pc);
-    (await canvasStream()).getTracks().forEach(t => pc.addTrack(t, stream));
-    pc.onicecandidate = e => e.candidate && send({t:'ice', c:e.candidate, to:m.from});
-    await pc.setLocalDescription(await pc.createOffer());
-    send({t:'offer', d:pc.localDescription, to:m.from});
-  } else if (m.t === 'answer') {
-    await pcs.get(m.from)?.setRemoteDescription(m.d);
-  } else if (m.t === 'ice') {
-    await pcs.get(m.from)?.addIceCandidate(m.c).catch(()=>{});
-  } else if (m.t === 'key') {
-    if (!ROLE_KEYS.guest.includes(m.code)) return;   // a guest drives P2 only
-    $('#last').textContent = `P2 ${m.code}`;         // proves the key crossed over
-    let h = guestHeld.get(m.from);
-    if (!h) guestHeld.set(m.from, h = new Set());
-    m.down ? h.add(m.code) : h.delete(m.code);
-    inject(m.code, m.down);
-  } else if (m.t === 'leave') {
-    // Otherwise P2 keeps running in whatever direction they left holding.
-    for (const code of guestHeld.get(m.from) || []) inject(code, false);
-    guestHeld.delete(m.from);
-    pcs.get(m.from)?.close(); pcs.delete(m.from);
-    if (!pcs.size && frames) { clearInterval(frames); frames = null; }
-  }
+function startGame() {
+  $('#role').textContent = host ? 'PLAYER 1' : 'PLAYER 2';
+  $('#keys').innerHTML = host
+    ? 'your keys <b>WASD</b> · press <b>Shift</b> at the menu for 2-player'
+    : 'your keys <b>arrows</b> or <b>WASD</b>';
+  player = window.RufflePlayer.newest().createPlayer();
+  stage.append(player);
+  load();
+  // Ruffle only acts on keys once it has focus, and in an iframe the document has
+  // to be focused first — a click on the page is not enough inside Discord.
+  addEventListener('pointerdown', () => { window.focus(); player.focus(); });
+  window.focus();
+  player.focus();
 }
 
 // Ruffle registers its key handlers on `window` (bubble phase), so an event
@@ -205,64 +161,28 @@ function inject(code, down) {
     {key, code, keyCode, which: keyCode, bubbles: true, composed: true}));
 }
 
-/* ---------- viewer: watches the host's pixels, sends keys back ---------- */
-let pc, feed;
-function startViewer() {
-  $('#role').textContent = 'PLAYER 2';
-  $('#keys').innerHTML = 'your keys <b>arrows</b> or <b>WASD</b>';
-  // Nothing here is focusable, and in an iframe the keys go nowhere until it is
-  // focused — which a click on a bare <img> does not do on its own.
-  addEventListener('pointerdown', () => window.focus());
-  window.focus();
-  if (!RTC) {
-    const img = new Image();
-    img.id = 'feed';
-    stage.append(img);
-    feed = img;
-    pcs.set(0, null);            // so the HUD still counts the host as a peer
-    return;
-  }
-  const v = document.createElement('video');
-  v.autoplay = v.playsInline = v.muted = true;
-  stage.append(v);
-  pc = new RTCPeerConnection(ICE);
-  pc.ontrack = e => v.srcObject = e.streams[0];
-  pc.onicecandidate = e => e.candidate && send({t:'ice', c:e.candidate});
-  pcs.set(0, pc);
-}
-
-async function viewerMsg(m) {
-  if (m.t === 'frame') {
-    if (feed) feed.src = m.d;
-  } else if (m.t === 'offer') {
-    await pc.setRemoteDescription(m.d);
-    await pc.setLocalDescription(await pc.createAnswer());
-    send({t:'answer', d:pc.localDescription, to:m.from});
-  } else if (m.t === 'ice') {
-    await pc.addIceCandidate(m.c).catch(()=>{});
-  }
-}
-
-/* ---------- input: host injects locally, viewers ship it upstream ---------- */
+/* ---------- input: play it here, and send it there ---------- */
 const held = new Set();
 
 function press(code, down) {
   if (down === held.has(code)) return;      // Key.isDown is state-based; no repeats
   down ? held.add(code) : held.delete(code);
-  if (!host) $('#last').textContent = `sent ${code}`;   // did this key leave at all?
-  host ? inject(code, down) : send({t:'key', code, down});
+  $('#last').textContent = `sent ${code}`;
+  inject(code, down);
+  send({t:'key', code, down});
 }
 
 function route(e) {
   if (!e.isTrusted) return;                 // our own inject(); let it reach Ruffle
   if (host === null || e.repeat) return;    // role not assigned yet
-  // The guest's keys are only ever a message to the host, so WASD can stand in for
-  // the arrows — useful anywhere the arrows are spoken for, Discord included.
+
+  // Restarting one copy alone just guarantees the two disagree.
+  if (e.code === 'KeyR' && e.type === 'keydown') { send({t:'restart'}); load(); return; }
+
   const code = host ? e.code : (GUEST_ALIAS[e.code] || e.code);
-  const allowed = ROLE_KEYS[host ? 'host' : 'guest'];
-  if (!allowed.includes(code)) {
+  if (!ROLE_KEYS[host ? 'host' : 'guest'].includes(code)) {
     // preventDefault alone does not stop Ruffle's own window listener, so P1's
-    // arrows would still drive P2 locally. Kill the event outright.
+    // arrows would still drive P2's character locally. Kill the event outright.
     if (KEYS[e.code]) { e.preventDefault(); e.stopImmediatePropagation(); }
     return;
   }
@@ -335,7 +255,7 @@ async function initDiscord() {
 
 function setActivity() {
   if (!authed) return;
-  const n = pcs.size + 1;
+  const n = peers.size + 1;
   sdk.commands.setActivity({ activity: {
     type: 0,
     details: n > 1 ? 'Playing together' : 'Waiting for Player 2',
