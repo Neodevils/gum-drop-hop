@@ -16,4 +16,11 @@ for (const c of P2) assert.ok(codes('guest').includes(c), `guest missing ${c}`);
 assert.ok(codes('host').includes(16), 'host cannot select 2-player mode');
 console.log('host  ->', codes('host').join(','), '(P1 87/83/65/68 + shift16 + space32)');
 console.log('guest ->', codes('guest').join(','), '(P2 38/40/37/39)');
+// Ruffle's key handlers sit on window (bubble phase), verified in the browser:
+// a non-bubbling dispatch at the player element never reaches the SWF, and
+// preventDefault alone does not stop that handler from seeing P1's arrows.
+const inject = src.match(/function inject[\s\S]*?\n\}/)[0];
+assert.ok(/\n  dispatchEvent\(new KeyboardEvent/.test(inject), 'inject must fire at window');
+assert.ok(/bubbles: true/.test(inject), 'injected keys must bubble to reach Ruffle');
+assert.ok(/stopImmediatePropagation/.test(src), 'blocked keys must not reach Ruffle');
 console.log('gate OK');

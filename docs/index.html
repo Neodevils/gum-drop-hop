@@ -148,12 +148,14 @@ async function hostMsg(m) {
   }
 }
 
+// Ruffle registers its key handlers on `window` (bubble phase), so an event
+// dispatched at the player element never reaches it. Fire at window instead.
 function inject(code, down) {
   const k = KEYS[code];
   if (!k) return;
   const [key, keyCode] = k;
-  player?.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
-    {key, code, keyCode, which: keyCode, bubbles: false, composed: true}));
+  dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
+    {key, code, keyCode, which: keyCode, bubbles: true, composed: true}));
 }
 
 /* ---------- viewer: watches the host's pixels, sends keys back ---------- */
@@ -190,9 +192,15 @@ function press(code, down) {
 }
 
 function route(e) {
+  if (!e.isTrusted) return;                 // our own inject(); let it reach Ruffle
   if (host === null || e.repeat) return;    // role not assigned yet
   const allowed = ROLE_KEYS[host ? 'host' : 'guest'];
-  if (!allowed.includes(e.code)) return;
+  if (!allowed.includes(e.code)) {
+    // preventDefault alone does not stop Ruffle's own window listener, so P1's
+    // arrows would still drive P2 locally. Kill the event outright.
+    if (KEYS[e.code]) { e.preventDefault(); e.stopImmediatePropagation(); }
+    return;
+  }
   e.preventDefault();
   press(e.code, e.type === 'keydown');
 }
