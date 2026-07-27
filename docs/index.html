@@ -94,7 +94,14 @@ ws.onmessage = async e => {
   setActivity();
 };
 ws.onclose = () => $('#role').textContent = 'disconnected';
-ws.onerror = () => $('#role').textContent = 'relay unreachable';
+ws.onerror = () => {
+  $('#role').textContent = 'relay unreachable';
+  // Inside Discord the only way to reach the Worker is a URL Mapping, so an
+  // unreachable relay almost always means the portal points somewhere else.
+  $('#keys').textContent = inDiscord
+    ? `no mapping serves ${new URL(RELAY.replace(/^ws/,'http')).pathname} — point the Discord URL Mapping at the Worker`
+    : `cannot reach ${RELAY}`;
+};
 
 /* ---------- host: owns the game, streams it out ---------- */
 let stream;
