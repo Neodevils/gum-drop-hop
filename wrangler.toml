@@ -1,6 +1,12 @@
 name = "gum-drop-hop"
 main = "worker.js"
 compatibility_date = "2026-07-01"
+# Without this, every deploy deletes secrets that aren't in this file — including
+# DISCORD_CLIENT_SECRET, which only ever exists in the secrets store.
+keep_vars = true
+
+[vars]
+DISCORD_CLIENT_ID = "1531351940741468462"
 
 [assets]
 directory = "docs"

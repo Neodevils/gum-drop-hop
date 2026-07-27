@@ -72,7 +72,13 @@ export default {
         headers: { 'content-type': 'application/json; charset=utf-8' } });
     }
 
-    if (at(url.pathname, '/health')) return json({ ok: true });
+    // The client id is public; serving it keeps one source of truth in the secrets
+    // store instead of a constant baked into the HTML.
+    if (at(url.pathname, '/config')) return json({ client_id: env.DISCORD_CLIENT_ID || '' });
+
+    // Reports only whether the secret is bound, never its value.
+    if (at(url.pathname, '/health'))
+      return json({ ok: true, secret_bound: !!env.DISCORD_CLIENT_SECRET });
     return new Response('gum-drop-hop relay', { status: 200 });
   },
 };
