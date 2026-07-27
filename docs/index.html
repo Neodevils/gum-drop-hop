@@ -23,11 +23,11 @@
 <div id="stage"></div>
 <div id="hud">
   <b id="role">connecting…</b><span id="peers"></span><span id="discord"></span>
-  <span class="kb">P1 <b>WASD</b></span><span class="kb">P2 <b>arrows</b></span>
+  <span class="kb" id="keys"></span>
 </div>
 <div id="pad">
-  <div><button data-code="ArrowLeft">◀</button><button data-code="ArrowRight">▶</button></div>
-  <div><button data-code="ArrowDown">▼</button><button data-code="ArrowUp">▲</button></div>
+  <div><button data-dir="left">◀</button><button data-dir="right">▶</button></div>
+  <div><button data-dir="down">▼</button><button data-dir="up">▲</button></div>
 </div>
 
 <script src="ruffle/ruffle.js"></script>
@@ -40,18 +40,29 @@
 // WebAudio, not the canvas). Tap the AudioContext destination into the stream if sound
 // matters. ponytail: STUN only — a symmetric-NAT pair needs a TURN server.
 
-const RELAY_DIRECT = 'wss://gum-drop-hop.truth-typhoon.workers.dev/ws';
+const RELAY_DIRECT = 'wss://gum-drop-hop.neodevils-contact.workers.dev/ws';
 const SCOPES = ['identify', 'rpc.activities.write'];
 
-// Calibration knob: physical key -> key the SWF listens for. Both players hit the same
-// controls; the SWF is single-player, so this is one character, two hands.
-const KEYMAP = {
-  KeyW:'ArrowUp', KeyA:'ArrowLeft', KeyS:'ArrowDown', KeyD:'ArrowRight', ShiftLeft:'Shift',
-  ArrowUp:'ArrowUp', ArrowLeft:'ArrowLeft', ArrowDown:'ArrowDown', ArrowRight:'ArrowRight',
-  ShiftRight:'Shift', Space:'Space', Enter:'Space',
+// keyCode is what the SWF's Key.isDown() actually tests, so it has to be exact.
+const KEYS = {
+  KeyW:['w',87], KeyA:['a',65], KeyS:['s',83], KeyD:['d',68],
+  ArrowUp:['ArrowUp',38], ArrowDown:['ArrowDown',40],
+  ArrowLeft:['ArrowLeft',37], ArrowRight:['ArrowRight',39],
+  ShiftLeft:['Shift',16], Space:[' ',32],
 };
-const KEYVAL = {ArrowUp:[38], ArrowDown:[40], ArrowLeft:[37], ArrowRight:[39],
-                Space:[32,' '], Shift:[16]};
+
+// Frame 96 runs two character clips with key sets hardcoded in the SWF: 87/83/65/68
+// drives one, 37/38/39/40 drives the other. So each machine is allowed exactly one
+// set and the mapping is identity — this is a gate, not a translation. Gating is the
+// whole point: without it the host's arrows drive the second character locally.
+const ROLE_KEYS = {
+  host:  ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'Space'],
+  guest: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'],
+};
+const PAD_KEYS = {
+  host:  {left:'KeyA', right:'KeyD', down:'KeyS', up:'KeyW'},
+  guest: {left:'ArrowLeft', right:'ArrowRight', down:'ArrowDown', up:'ArrowUp'},
+};
 
 const ICE = {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
 const q = new URLSearchParams(location.search);
@@ -73,7 +84,7 @@ const stage = $('#stage');
 const ws = new WebSocket(`${RELAY}?room=${encodeURIComponent(room)}`);
 const send = m => ws.readyState === 1 && ws.send(JSON.stringify(m));
 
-let host = null, player = null, pcs = new Map();
+let host = null, player = null, pcs = new Map(), guestHeld = new Map();
 
 ws.onmessage = async e => {
   const m = JSON.parse(e.data);
@@ -89,6 +100,7 @@ ws.onerror = () => $('#role').textContent = 'relay unreachable';
 let stream;
 function startHost() {
   $('#role').textContent = 'PLAYER 1';
+  $('#keys').innerHTML = 'your keys <b>WASD</b> · press <b>Shift</b> at the menu for 2-player';
   player = window.RufflePlayer.newest().createPlayer();
   stage.append(player);
   player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
@@ -116,22 +128,32 @@ async function hostMsg(m) {
   } else if (m.t === 'ice') {
     await pcs.get(m.from)?.addIceCandidate(m.c).catch(()=>{});
   } else if (m.t === 'key') {
+    if (!ROLE_KEYS.guest.includes(m.code)) return;   // a guest drives P2 only
+    let h = guestHeld.get(m.from);
+    if (!h) guestHeld.set(m.from, h = new Set());
+    m.down ? h.add(m.code) : h.delete(m.code);
     inject(m.code, m.down);
   } else if (m.t === 'leave') {
+    // Otherwise P2 keeps running in whatever direction they left holding.
+    for (const code of guestHeld.get(m.from) || []) inject(code, false);
+    guestHeld.delete(m.from);
     pcs.get(m.from)?.close(); pcs.delete(m.from);
   }
 }
 
-function inject(out, down) {
-  const [keyCode, key] = KEYVAL[out] || [0, out];
+function inject(code, down) {
+  const k = KEYS[code];
+  if (!k) return;
+  const [key, keyCode] = k;
   player?.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
-    {key: key ?? out, code: out, keyCode, which: keyCode, bubbles: false, composed: true}));
+    {key, code, keyCode, which: keyCode, bubbles: false, composed: true}));
 }
 
 /* ---------- viewer: watches the host's pixels, sends keys back ---------- */
 let pc;
 function startViewer() {
   $('#role').textContent = 'PLAYER 2';
+  $('#keys').innerHTML = 'your keys <b>arrow keys</b>';
   const v = document.createElement('video');
   v.autoplay = v.playsInline = v.muted = true;
   stage.append(v);
@@ -152,16 +174,29 @@ async function viewerMsg(m) {
 }
 
 /* ---------- input: host injects locally, viewers ship it upstream ---------- */
-function press(out, down) { host ? inject(out, down) : send({t:'key', code:out, down}); }
+const held = new Set();
+
+function press(code, down) {
+  if (down === held.has(code)) return;      // Key.isDown is state-based; no repeats
+  down ? held.add(code) : held.delete(code);
+  host ? inject(code, down) : send({t:'key', code, down});
+}
 
 function route(e) {
-  const out = KEYMAP[e.code];
-  if (!out || e.repeat) return;
+  if (host === null || e.repeat) return;    // role not assigned yet
+  const allowed = ROLE_KEYS[host ? 'host' : 'guest'];
+  if (!allowed.includes(e.code)) return;
   e.preventDefault();
-  press(out, e.type === 'keydown');
+  press(e.code, e.type === 'keydown');
 }
 addEventListener('keydown', route, true);
 addEventListener('keyup', route, true);
+
+// A keyup lost to a tab switch or a dropped connection leaves the character running.
+function releaseAll() { for (const code of [...held]) press(code, false); }
+addEventListener('blur', releaseAll);
+addEventListener('pagehide', releaseAll);
+document.addEventListener('visibilitychange', () => document.hidden && releaseAll());
 
 /* ---------- touch: phones and tablets get a pad instead of a keyboard ---------- */
 const coarse = matchMedia('(any-pointer: coarse)').matches;
@@ -170,9 +205,10 @@ if (coarse && touchable) {
   document.body.classList.add('touch');
   document.querySelectorAll('.kb').forEach(n => n.remove());
   for (const b of document.querySelectorAll('#pad button')) {
-    const code = b.dataset.code;
-    const down = e => { e.preventDefault(); press(code, true); };
-    const up = e => { e.preventDefault(); press(code, false); };
+    const dir = b.dataset.dir;
+    const code = () => PAD_KEYS[host ? 'host' : 'guest'][dir];
+    const down = e => { e.preventDefault(); press(code(), true); };
+    const up = e => { e.preventDefault(); press(code(), false); };
     b.addEventListener('pointerdown', down);
     b.addEventListener('pointerup', up);
     b.addEventListener('pointercancel', up);
