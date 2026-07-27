@@ -23,7 +23,7 @@
 <div id="stage"></div>
 <div id="hud">
   <b id="role">connecting…</b><span id="peers"></span><span id="discord"></span>
-  <span class="kb" id="keys"></span>
+  <span class="kb" id="keys"></span><span id="last"></span>
 </div>
 <div id="pad">
   <div><button data-dir="left">◀</button><button data-dir="right">▶</button></div>
@@ -59,6 +59,7 @@ const ROLE_KEYS = {
   host:  ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'Space'],
   guest: ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'],
 };
+const GUEST_ALIAS = {KeyW:'ArrowUp', KeyS:'ArrowDown', KeyA:'ArrowLeft', KeyD:'ArrowRight'};
 const PAD_KEYS = {
   host:  {left:'KeyA', right:'KeyD', down:'KeyS', up:'KeyW'},
   guest: {left:'ArrowLeft', right:'ArrowRight', down:'ArrowDown', up:'ArrowUp'},
@@ -151,15 +152,18 @@ async function startFrames() {
   // renders neither, so this cannot be settled anywhere but a real browser.
   const src = await gameCanvas();
   const c = document.createElement('canvas'), ctx = c.getContext('2d');
+  // ponytail: 800px at 12fps is roughly 400KB/s through the relay. WIDTH and the
+  // interval are the two knobs — halve them if Discord starts dropping the socket.
+  const WIDTH = 800;
   frames = setInterval(() => {
     if (!pcs.size) return;
     const from = v.videoWidth ? v : src;
     const w = from.videoWidth || from.width, h = from.videoHeight || from.height;
     if (!w) return;
-    c.width = 480; c.height = Math.round(480 * h / w);
+    c.width = Math.min(WIDTH, w); c.height = Math.round(c.width * h / w);
     ctx.drawImage(from, 0, 0, c.width, c.height);
-    send({t:'frame', d: c.toDataURL('image/jpeg', 0.5)});
-  }, 100);
+    send({t:'frame', d: c.toDataURL('image/jpeg', 0.72)});
+  }, 80);
 }
 
 async function hostMsg(m) {
@@ -177,6 +181,7 @@ async function hostMsg(m) {
     await pcs.get(m.from)?.addIceCandidate(m.c).catch(()=>{});
   } else if (m.t === 'key') {
     if (!ROLE_KEYS.guest.includes(m.code)) return;   // a guest drives P2 only
+    $('#last').textContent = `P2 ${m.code}`;         // proves the key crossed over
     let h = guestHeld.get(m.from);
     if (!h) guestHeld.set(m.from, h = new Set());
     m.down ? h.add(m.code) : h.delete(m.code);
@@ -204,7 +209,11 @@ function inject(code, down) {
 let pc, feed;
 function startViewer() {
   $('#role').textContent = 'PLAYER 2';
-  $('#keys').innerHTML = 'your keys <b>arrow keys</b>';
+  $('#keys').innerHTML = 'your keys <b>arrows</b> or <b>WASD</b>';
+  // Nothing here is focusable, and in an iframe the keys go nowhere until it is
+  // focused — which a click on a bare <img> does not do on its own.
+  addEventListener('pointerdown', () => window.focus());
+  window.focus();
   if (!RTC) {
     const img = new Image();
     img.id = 'feed';
@@ -240,21 +249,25 @@ const held = new Set();
 function press(code, down) {
   if (down === held.has(code)) return;      // Key.isDown is state-based; no repeats
   down ? held.add(code) : held.delete(code);
+  if (!host) $('#last').textContent = `sent ${code}`;   // did this key leave at all?
   host ? inject(code, down) : send({t:'key', code, down});
 }
 
 function route(e) {
   if (!e.isTrusted) return;                 // our own inject(); let it reach Ruffle
   if (host === null || e.repeat) return;    // role not assigned yet
+  // The guest's keys are only ever a message to the host, so WASD can stand in for
+  // the arrows — useful anywhere the arrows are spoken for, Discord included.
+  const code = host ? e.code : (GUEST_ALIAS[e.code] || e.code);
   const allowed = ROLE_KEYS[host ? 'host' : 'guest'];
-  if (!allowed.includes(e.code)) {
+  if (!allowed.includes(code)) {
     // preventDefault alone does not stop Ruffle's own window listener, so P1's
     // arrows would still drive P2 locally. Kill the event outright.
     if (KEYS[e.code]) { e.preventDefault(); e.stopImmediatePropagation(); }
     return;
   }
   e.preventDefault();
-  press(e.code, e.type === 'keydown');
+  press(code, e.type === 'keydown');
 }
 addEventListener('keydown', route, true);
 addEventListener('keyup', route, true);
