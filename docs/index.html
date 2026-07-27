@@ -59,10 +59,12 @@ const q = new URLSearchParams(location.search);
 const inDiscord = location.hostname.endsWith('.discordsays.com') ||
                   q.has('instance_id') || q.has('frame_id') || q.has('discord_proxy_ticket');
 
-// Inside Discord the Worker is reached through a mapped same-origin prefix (/api),
-// never a cross-origin wss:// — that is what the URL Mappings entry is for.
-const RELAY = q.get('server') ||
-  (inDiscord ? `${location.origin.replace(/^http/,'ws')}/api/ws` : RELAY_DIRECT);
+// Same origin everywhere the Worker serves the page too — on Cloudflare it is the
+// Worker itself, in Discord it is the mapped /api prefix. Only the GitHub Pages
+// mirror has no Worker behind it and needs the cross-origin address.
+const RELAY = q.get('server') || (location.hostname.endsWith('github.io')
+  ? RELAY_DIRECT
+  : `${location.origin.replace(/^http/,'ws')}/api/ws`);
 
 // Discord hands every participant of one activity the same instance_id -> same room.
 const room = q.get('room') || q.get('instance_id') || location.hash.slice(1) || 'lobby';

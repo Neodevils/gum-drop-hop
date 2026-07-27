@@ -21,7 +21,11 @@ export class Room {
       this.broadcast(id, m, m.to);
     });
 
-    const drop = () => { this.peers.delete(id); this.broadcast(id, { t: 'leave', from: id }); };
+    // close and error can both fire for one socket; only announce the departure once.
+    const drop = () => {
+      if (!this.peers.delete(id)) return;
+      this.broadcast(id, { t: 'leave', from: id });
+    };
     server.addEventListener('close', drop);
     server.addEventListener('error', drop);
 
