@@ -35,13 +35,43 @@ export class Room {
   send(ws, msg) { try { ws.send(JSON.stringify(msg)); } catch {} }
 }
 
+// Discord may or may not strip the mapped /api prefix before forwarding, so every
+// route answers under both spellings.
+const at = (path, ...names) => names.some(n => path === n || path === `/api${n}`);
+
 export default {
-  fetch(req, env) {
+  async fetch(req, env) {
     const url = new URL(req.url);
-    if (url.pathname.endsWith('/ws')) {
+
+    if (at(url.pathname, '/ws', '/room')) {
       const room = url.searchParams.get('room') || 'lobby';
       return env.ROOM.get(env.ROOM.idFromName(room)).fetch(req);
     }
-    return new Response('gum-drop-hop relay', {status: 200});
+
+    // Exchanges the Embedded App SDK's authorization code for a token so the client
+    // can call setActivity. Needs DISCORD_CLIENT_ID + DISCORD_CLIENT_SECRET secrets.
+    if (at(url.pathname, '/auth/discord/token') && req.method === 'POST') {
+      if (!env.DISCORD_CLIENT_SECRET) return json({ error: 'secret_not_configured' }, 500);
+      const { code } = await req.json().catch(() => ({}));
+      if (!code) return json({ error: 'missing_code' }, 400);
+      const res = await fetch('https://discord.com/api/oauth2/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: env.DISCORD_CLIENT_ID,
+          client_secret: env.DISCORD_CLIENT_SECRET,
+          grant_type: 'authorization_code',
+          code,
+        }),
+      });
+      return new Response(await res.text(), { status: res.status,
+        headers: { 'content-type': 'application/json; charset=utf-8' } });
+    }
+
+    if (at(url.pathname, '/health')) return json({ ok: true });
+    return new Response('gum-drop-hop relay', { status: 200 });
   },
 };
+
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status,
+  headers: { 'content-type': 'application/json; charset=utf-8' } });

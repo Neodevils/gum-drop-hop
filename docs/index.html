@@ -1,20 +1,34 @@
 <!doctype html>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>Gum Drop Hop</title>
 <style>
-  html,body{margin:0;height:100%;background:#000;color:#e8e8ea;
-            font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+  html,body{margin:0;height:100%;background:#000;color:#e8e8ea;overscroll-behavior:none;
+            font:13px/1.4 system-ui,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
   #stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
   ruffle-player,video{width:100%;height:100%;object-fit:contain;background:#000}
   #hud{position:absolute;top:0;left:0;right:0;display:flex;gap:14px;padding:7px 12px;
        background:linear-gradient(#000c,#0000);pointer-events:none;z-index:2}
-  #hud b{color:#ff9ecb}
-  #hud span{opacity:.65}
+  #hud b{color:#ff9ecb} #hud span{opacity:.7}
+  #pad{display:none;position:absolute;inset:auto 0 0 0;justify-content:space-between;
+       padding:16px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));z-index:3}
+  #pad div{display:flex;gap:12px}
+  #pad button{width:64px;height:64px;border-radius:50%;border:1px solid #ffffff2e;
+              background:#ffffff1c;color:#fff;font-size:22px;-webkit-tap-highlight-color:transparent;touch-action:none}
+  #pad button:active{background:#ff9ecb55}
+  /* Touch layout only where the pointer is actually coarse. */
+  @media (any-pointer:coarse){ body.touch #pad{display:flex} body.touch #hud{font-size:11px} }
 </style>
 
 <div id="stage"></div>
-<div id="hud"><b id="role">connecting…</b><span>P1 <b>WASD</b></span><span>P2 <b>arrows</b></span><span id="peers"></span></div>
+<div id="hud">
+  <b id="role">connecting…</b><span id="peers"></span><span id="discord"></span>
+  <span class="kb">P1 <b>WASD</b></span><span class="kb">P2 <b>arrows</b></span>
+</div>
+<div id="pad">
+  <div><button data-code="ArrowLeft">◀</button><button data-code="ArrowRight">▶</button></div>
+  <div><button data-code="ArrowDown">▼</button><button data-code="ArrowUp">▲</button></div>
+</div>
 
 <script src="ruffle/ruffle.js"></script>
 <script>
@@ -25,6 +39,10 @@
 // ponytail: video is one-way host->viewers and carries no audio (Ruffle mixes through
 // WebAudio, not the canvas). Tap the AudioContext destination into the stream if sound
 // matters. ponytail: STUN only — a symmetric-NAT pair needs a TURN server.
+
+const RELAY_DIRECT = 'wss://gum-drop-hop.truth-typhoon.workers.dev/ws';
+const DISCORD_CLIENT_ID = '';   // <- your Discord application id enables Rich Presence
+const SCOPES = ['identify', 'rpc.activities.write'];
 
 // Calibration knob: physical key -> key the SWF listens for. Both players hit the same
 // controls; the SWF is single-player, so this is one character, two hands.
@@ -38,15 +56,19 @@ const KEYVAL = {ArrowUp:[38], ArrowDown:[40], ArrowLeft:[37], ArrowRight:[39],
 
 const ICE = {iceServers:[{urls:'stun:stun.l.google.com:19302'}]};
 const q = new URLSearchParams(location.search);
-// Discord hands every participant of one activity the same instance_id -> same room.
-const room = q.get('instance_id') || location.hash.slice(1) || 'lobby';
+const inDiscord = location.hostname.endsWith('.discordsays.com') ||
+                  q.has('instance_id') || q.has('frame_id') || q.has('discord_proxy_ticket');
 
-const stage = document.getElementById('stage');
-// Inside Discord every external host must be reached through the /.proxy/ prefix;
-// standalone we hit the Worker directly. ?ws= overrides for a self-hosted relay.
-const RELAY = q.get('ws') || (q.get('frame_id')
-  ? `${location.origin.replace('http','ws')}/.proxy/ws`
-  : 'wss://gum-drop-hop.truth-typhoon.workers.dev/ws');
+// Inside Discord the Worker is reached through a mapped same-origin prefix (/api),
+// never a cross-origin wss:// — that is what the URL Mappings entry is for.
+const RELAY = q.get('server') ||
+  (inDiscord ? `${location.origin.replace(/^http/,'ws')}/api/ws` : RELAY_DIRECT);
+
+// Discord hands every participant of one activity the same instance_id -> same room.
+const room = q.get('room') || q.get('instance_id') || location.hash.slice(1) || 'lobby';
+
+const $ = s => document.querySelector(s);
+const stage = $('#stage');
 const ws = new WebSocket(`${RELAY}?room=${encodeURIComponent(room)}`);
 const send = m => ws.readyState === 1 && ws.send(JSON.stringify(m));
 
@@ -56,14 +78,16 @@ ws.onmessage = async e => {
   const m = JSON.parse(e.data);
   if (m.t === 'role') { host = m.host; host ? startHost() : startViewer(); return; }
   if (host) await hostMsg(m); else await viewerMsg(m);
-  document.getElementById('peers').textContent = pcs.size ? `${pcs.size} connected` : '';
+  $('#peers').textContent = pcs.size ? `${pcs.size + 1} playing` : 'waiting for P2';
+  setActivity();
 };
-ws.onclose = () => document.getElementById('role').textContent = 'disconnected';
+ws.onclose = () => $('#role').textContent = 'disconnected';
+ws.onerror = () => $('#role').textContent = 'relay unreachable';
 
 /* ---------- host: owns the game, streams it out ---------- */
 let stream;
 function startHost() {
-  document.getElementById('role').textContent = 'HOST';
+  $('#role').textContent = 'PLAYER 1';
   player = window.RufflePlayer.newest().createPlayer();
   stage.append(player);
   player.ruffle().load({url:'game.swf', autoplay:'on', unmuteOverlay:'hidden',
@@ -106,7 +130,7 @@ function inject(out, down) {
 /* ---------- viewer: watches the host's pixels, sends keys back ---------- */
 let pc;
 function startViewer() {
-  document.getElementById('role').textContent = 'PLAYER 2';
+  $('#role').textContent = 'PLAYER 2';
   const v = document.createElement('video');
   v.autoplay = v.playsInline = v.muted = true;
   stage.append(v);
@@ -127,13 +151,71 @@ async function viewerMsg(m) {
 }
 
 /* ---------- input: host injects locally, viewers ship it upstream ---------- */
+function press(out, down) { host ? inject(out, down) : send({t:'key', code:out, down}); }
+
 function route(e) {
   const out = KEYMAP[e.code];
   if (!out || e.repeat) return;
   e.preventDefault();
-  const down = e.type === 'keydown';
-  host ? inject(out, down) : send({t:'key', code:out, down});
+  press(out, e.type === 'keydown');
 }
 addEventListener('keydown', route, true);
 addEventListener('keyup', route, true);
+
+/* ---------- touch: phones and tablets get a pad instead of a keyboard ---------- */
+const coarse = matchMedia('(any-pointer: coarse)').matches;
+const touchable = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+if (coarse && touchable) {
+  document.body.classList.add('touch');
+  document.querySelectorAll('.kb').forEach(n => n.remove());
+  for (const b of document.querySelectorAll('#pad button')) {
+    const code = b.dataset.code;
+    const down = e => { e.preventDefault(); press(code, true); };
+    const up = e => { e.preventDefault(); press(code, false); };
+    b.addEventListener('pointerdown', down);
+    b.addEventListener('pointerup', up);
+    b.addEventListener('pointercancel', up);
+    b.addEventListener('pointerleave', up);
+  }
+}
+
+/* ---------- Discord: handshake, then Rich Presence ---------- */
+let sdk = null, authed = false;
+async function initDiscord() {
+  if (!inDiscord || !DISCORD_CLIENT_ID) return;
+  const el = $('#discord');
+  try {
+    const { DiscordSDK } = await import('./discord-sdk.js');
+    sdk = new DiscordSDK(DISCORD_CLIENT_ID);
+    await sdk.ready();
+    el.textContent = 'discord ✓';
+    const { code } = await sdk.commands.authorize({
+      client_id: DISCORD_CLIENT_ID, response_type: 'code', state: '', prompt: 'none', scope: SCOPES,
+    });
+    const r = await fetch('/api/auth/discord/token', {
+      method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({code}),
+    });
+    const { access_token } = await r.json();
+    if (!access_token) throw new Error('no token');
+    await sdk.commands.authenticate({ access_token });
+    authed = true;
+    setActivity();
+  } catch (err) {
+    el.textContent = '';
+    console.warn('discord init failed', err);
+  }
+}
+
+function setActivity() {
+  if (!authed) return;
+  const n = pcs.size + 1;
+  sdk.commands.setActivity({ activity: {
+    type: 0,
+    details: n > 1 ? 'Playing together' : 'Waiting for Player 2',
+    state: `${n}/2 players`,
+    party: { id: room, size: [n, 2] },
+    instance: true,
+  }}).catch(() => {});
+}
+initDiscord();
 </script>
